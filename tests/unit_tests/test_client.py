@@ -1241,20 +1241,19 @@ def test_upsert_examples_multipart(mock_session_cls: mock.Mock) -> None:
             assert part.headers["Content-Type"] == "application/json"
 
 
-def test_example_create_reference_outputs_alias() -> None:
-    reference_outputs = {"answer": 42}
-
+@pytest.mark.parametrize("reference_outputs", [{"answer": 42}, None])
+def test_example_create_reference_outputs_alias(reference_outputs: Optional[dict[str, Any]]) -> None:
     canonical = ls_schemas.ExampleCreate(reference_outputs=reference_outputs)
     assert canonical.reference_outputs == reference_outputs
     assert canonical.outputs == reference_outputs
-    assert canonical.model_dump(exclude_none=True)["reference_outputs"] == reference_outputs
+    assert canonical.model_dump(exclude_none=True).get("reference_outputs") == reference_outputs
     assert "outputs" not in canonical.model_dump()
 
     with pytest.warns(DeprecationWarning, match="Use 'reference_outputs' instead"):
         legacy = ls_schemas.ExampleCreate(outputs=reference_outputs)
     assert legacy.reference_outputs == reference_outputs
     assert legacy.outputs == reference_outputs
-    assert legacy.model_dump(exclude_none=True)["reference_outputs"] == reference_outputs
+    assert legacy.model_dump(exclude_none=True).get("reference_outputs") == reference_outputs
     assert "outputs" not in legacy.model_dump()
 
     with pytest.raises(ValueError, match="both 'reference_outputs' and 'outputs'"):
@@ -1264,15 +1263,24 @@ def test_example_create_reference_outputs_alias() -> None:
         )
 
 
-@pytest.mark.parametrize("argument_name", ["reference_outputs", "outputs"])
+@pytest.mark.parametrize(
+    "argument_name, reference_outputs",
+    [
+        ("reference_outputs", {"answer": 42}),
+        ("outputs", {"answer": 42}),
+        ("reference_outputs", None),
+        ("outputs", None),
+        (None, None),
+    ],
+)
 @mock.patch("langsmith.client.requests.Session")
 def test_create_example_json_uses_reference_outputs(
     mock_session_cls: mock.Mock,
-    argument_name: str,
+    argument_name: Optional[str],
+    reference_outputs: Optional[dict[str, Any]],
 ) -> None:
     example_id = uuid.uuid4()
     dataset_id = uuid.uuid4()
-    reference_outputs = {"answer": 42}
     mock_response = MagicMock()
     mock_response.status_code = 200
     mock_response.json.return_value = {
@@ -1296,27 +1304,38 @@ def test_create_example_json_uses_reference_outputs(
         client.create_example(
             inputs={"question": "meaning"},
             dataset_id=dataset_id,
-            **{argument_name: reference_outputs},
+            **({argument_name: reference_outputs} if argument_name else {}),
         )
 
     request = next(call for call in mock_session.request.call_args_list if call.args[0] == "POST")
     payload = json.loads(request.kwargs["data"])
-    assert payload["reference_outputs"] == reference_outputs
+    assert payload.get("reference_outputs") == reference_outputs
     assert "outputs" not in payload
     deprecations = [warning for warning in recorded if warning.category is DeprecationWarning]
     assert len(deprecations) == (1 if argument_name == "outputs" else 0)
 
 
-def test_create_example_rejects_reference_outputs_conflict() -> None:
+@pytest.mark.parametrize("reference_outputs", [{"answer": 42}, None])
+@pytest.mark.parametrize("outputs", [{"answer": 43}, None])
+def test_create_example_rejects_reference_outputs_conflict(
+    reference_outputs: Optional[dict[str, Any]], outputs: Optional[dict[str, Any]]
+) -> None:
     client = Client(api_url="http://localhost:1984", api_key="123", info={})
 
-    with pytest.raises(ValueError, match="both 'reference_outputs' and 'outputs'"):
-        client.create_example(
-            inputs={"question": "meaning"},
-            dataset_id=uuid.uuid4(),
-            reference_outputs={"answer": 42},
-            outputs={"answer": 43},
-        )
+    with (
+        mock.patch.object(Client, "read_dataset") as read_dataset,
+        mock.patch.object(Client, "request_with_retries") as request,
+    ):
+        with pytest.raises(ValueError, match="both 'reference_outputs' and 'outputs'"):
+            client.create_example(
+                inputs={"question": "meaning"},
+                dataset_name="example-dataset",
+                reference_outputs=reference_outputs,
+                outputs=outputs,
+            )
+
+    read_dataset.assert_not_called()
+    request.assert_not_called()
 
 
 @pytest.mark.parametrize("argument_name", ["reference_outputs", "outputs"])
@@ -1345,16 +1364,41 @@ def test_create_examples_reference_outputs_alias(argument_name: str) -> None:
     assert len(deprecations) == (1 if argument_name == "outputs" else 0)
 
 
-def test_create_examples_rejects_reference_outputs_conflict() -> None:
+@pytest.mark.parametrize("use_examples", [False, True])
+@pytest.mark.parametrize("reference_outputs", [{"answer": 42}, None])
+@pytest.mark.parametrize("outputs", [{"answer": 43}, None])
+def test_create_examples_rejects_reference_outputs_conflict(
+    use_examples: bool, reference_outputs: Optional[dict[str, Any]], outputs: Optional[dict[str, Any]]
+) -> None:
     client = Client(api_url="http://localhost:1984", api_key="123", info={})
+    kwargs = (
+        {
+            "examples": [
+                {"inputs": {"question": "valid"}, "reference_outputs": {"answer": 42}},
+                {
+                    "inputs": {"question": "meaning"},
+                    "reference_outputs": reference_outputs,
+                    "outputs": outputs,
+                },
+            ]
+        }
+        if use_examples
+        else {
+            "inputs": [{"question": "meaning"}],
+            "reference_outputs": [reference_outputs],
+            "outputs": [outputs],
+        }
+    )
 
-    with pytest.raises(ValueError, match="both 'reference_outputs' and 'outputs'"):
-        client.create_examples(
-            dataset_id=uuid.uuid4(),
-            inputs=[{"question": "meaning"}],
-            reference_outputs=[{"answer": 42}],
-            outputs=[{"answer": 43}],
-        )
+    with (
+        mock.patch.object(Client, "read_dataset") as read_dataset,
+        mock.patch.object(Client, "_upload_examples_batches_parallel") as upload,
+    ):
+        with pytest.raises(ValueError, match="both 'reference_outputs' and 'outputs'"):
+            client.create_examples(dataset_name="example-dataset", **kwargs)
+
+    read_dataset.assert_not_called()
+    upload.assert_not_called()
 
 
 @mock.patch("langsmith.client.requests.Session")

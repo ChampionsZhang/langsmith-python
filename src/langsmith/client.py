@@ -6730,8 +6730,6 @@ class Client:
 
         if not (dataset_id or dataset_name):
             raise ValueError("Either dataset_id or dataset_name must be provided.")
-        elif not dataset_id:
-            dataset_id = self.read_dataset(dataset_name=dataset_name).id
 
         if examples:
             uploads = [ls_schemas.ExampleCreate(**x) if isinstance(x, dict) else x for x in examples]
@@ -6769,6 +6767,9 @@ class Client:
                     kwargs.get("source_run_ids") or (None for _ in range(input_len)),
                 )
             ]
+
+        if not dataset_id:
+            dataset_id = self.read_dataset(dataset_name=dataset_name).id
 
         if not uploads:
             return ls_schemas.UpsertExamplesResponse(
@@ -6859,7 +6860,7 @@ class Client:
         dataset_id: Optional[ID_TYPE] = None,
         dataset_name: Optional[str] = None,
         created_at: Optional[datetime.datetime] = None,
-        reference_outputs: Optional[Mapping[str, Any]] = None,
+        reference_outputs: Optional[Mapping[str, Any]] = cast(Any, _UNSET),
         metadata: Optional[Mapping[str, Any]] = None,
         split: Optional[str | list[str]] = None,
         example_id: Optional[ID_TYPE] = None,
@@ -6868,7 +6869,7 @@ class Client:
         use_source_run_attachments: Optional[list[str]] = None,
         attachments: Optional[ls_schemas.Attachments] = None,
         *,
-        outputs: Optional[Mapping[str, Any]] = None,
+        outputs: Optional[Mapping[str, Any]] = cast(Any, _UNSET),
     ) -> ls_schemas.Example:
         """Create a dataset example in the LangSmith API.
 
@@ -6910,15 +6911,17 @@ class Client:
         Returns:
             Example: The created example.
         """
-        if reference_outputs is not None and outputs is not None:
+        if reference_outputs is not _UNSET and outputs is not _UNSET:
             raise ValueError("Cannot specify both 'reference_outputs' and 'outputs'.")
-        if outputs is not None:
+        if outputs is not _UNSET:
             warnings.warn(
                 "'outputs' is deprecated. Use 'reference_outputs' instead.",
                 DeprecationWarning,
                 stacklevel=2,
             )
             reference_outputs = outputs
+        elif reference_outputs is _UNSET:
+            reference_outputs = None
 
         if inputs is None and not use_source_run_io:
             raise ValueError("Must provide either inputs or use_source_run_io")
@@ -7246,12 +7249,12 @@ class Client:
             examples = [
                 {
                     "inputs": {"question": "what's an agent"},
-                    "outputs": {"answer": "an agent is..."},
+                    "reference_outputs": {"answer": "an agent is..."},
                     "metadata": {"difficulty": "easy"},
                 },
                 {
                     "inputs": {"question": "can you explain the agent architecture in this diagram?"},
-                    "outputs": {"answer": "this diagram shows..."},
+                    "reference_outputs": {"answer": "this diagram shows..."},
                     "attachments": {"diagram": {"mime_type": "image/png", "data": b"..."}},
                     "metadata": {"difficulty": "medium"},
                 },

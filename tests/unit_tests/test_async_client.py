@@ -7,6 +7,7 @@ import pathlib
 import uuid
 import warnings
 from datetime import datetime
+from typing import Any, Optional
 from unittest import mock
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
@@ -961,11 +962,21 @@ async def test_async_client_resource_version_check(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("argument_name", ["reference_outputs", "outputs"])
-async def test_create_example_reference_outputs_alias(argument_name: str) -> None:
+@pytest.mark.parametrize(
+    "argument_name, reference_outputs",
+    [
+        ("reference_outputs", {"answer": 42}),
+        ("outputs", {"answer": 42}),
+        ("reference_outputs", None),
+        ("outputs", None),
+        (None, None),
+    ],
+)
+async def test_create_example_reference_outputs_alias(
+    argument_name: Optional[str], reference_outputs: Optional[dict[str, Any]]
+) -> None:
     client = AsyncClient(api_url="http://localhost:1984", api_key="test")
     dataset_id = uuid.uuid4()
-    reference_outputs = {"answer": 42}
     response = MagicMock()
     response.json.return_value = {
         "id": str(uuid.uuid4()),
@@ -985,7 +996,7 @@ async def test_create_example_reference_outputs_alias(argument_name: str) -> Non
             await client.create_example(
                 inputs={"question": "meaning"},
                 dataset_id=dataset_id,
-                **{argument_name: reference_outputs},
+                **({argument_name: reference_outputs} if argument_name else {}),
             )
 
     payload = json.loads(request.call_args.kwargs["content"])
@@ -997,15 +1008,26 @@ async def test_create_example_reference_outputs_alias(argument_name: str) -> Non
 
 
 @pytest.mark.asyncio
-async def test_create_example_rejects_reference_outputs_conflict() -> None:
+@pytest.mark.parametrize("reference_outputs", [{"answer": 42}, None])
+@pytest.mark.parametrize("outputs", [{"answer": 43}, None])
+async def test_create_example_rejects_reference_outputs_conflict(
+    reference_outputs: Optional[dict[str, Any]], outputs: Optional[dict[str, Any]]
+) -> None:
     client = AsyncClient(api_url="http://localhost:1984", api_key="test")
 
-    with pytest.raises(ValueError, match="both 'reference_outputs' and 'outputs'"):
-        await client.create_example(
-            inputs={"question": "meaning"},
-            dataset_id=uuid.uuid4(),
-            reference_outputs={"answer": 42},
-            outputs={"answer": 43},
-        )
+    with (
+        mock.patch.object(AsyncClient, "read_dataset", new_callable=AsyncMock) as read_dataset,
+        mock.patch.object(AsyncClient, "_arequest_with_retries", new_callable=AsyncMock) as request,
+    ):
+        with pytest.raises(ValueError, match="both 'reference_outputs' and 'outputs'"):
+            await client.create_example(
+                inputs={"question": "meaning"},
+                dataset_name="example-dataset",
+                reference_outputs=reference_outputs,
+                outputs=outputs,
+            )
+
+    read_dataset.assert_not_called()
+    request.assert_not_called()
 
     await client.aclose()
