@@ -435,7 +435,7 @@ dataset = client.create_dataset(dataset_name, description="An example dataset")
 for run in runs:
     client.create_example(
         inputs=run.inputs,
-        outputs=run.outputs,
+        reference_outputs=run.outputs,
         dataset_id=dataset.id,
     )
 ```

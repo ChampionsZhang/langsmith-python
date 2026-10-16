@@ -6021,7 +6021,7 @@ class Client:
             try:
                 self.create_examples(
                     inputs=[e.inputs for e in examples],
-                    outputs=[e.outputs for e in examples],
+                    reference_outputs=[e.outputs for e in examples],
                     dataset_id=dataset.id,
                 )
             except BaseException as e:
@@ -6068,7 +6068,7 @@ class Client:
         """
         return self.create_example(
             inputs={"input": prompt},
-            outputs={"output": generation},
+            reference_outputs={"output": generation},
             dataset_id=dataset_id,
             dataset_name=dataset_name,
             created_at=created_at,
@@ -6114,7 +6114,7 @@ class Client:
                 final_generations = cast(dict, generations)
         return self.create_example(
             inputs={"input": final_input},
-            outputs=({"output": final_generations} if final_generations is not None else None),
+            reference_outputs=({"output": final_generations} if final_generations is not None else None),
             dataset_id=dataset_id,
             dataset_name=dataset_name,
             created_at=created_at,
@@ -6188,7 +6188,7 @@ class Client:
             raise ValueError(f"Dataset type {dataset_type} not recognized.")
         return self.create_example(
             inputs=inputs,
-            outputs=outputs,
+            reference_outputs=outputs,
             dataset_id=dataset_id,
             dataset_name=dataset_name,
             created_at=created_at,
@@ -6286,8 +6286,9 @@ class Client:
                     )
                 )
 
-            if example.outputs is not None:
-                outputsb = _dumps_json(example.outputs)
+            outputs = example.reference_outputs if isinstance(example, ls_schemas.ExampleCreate) else example.outputs
+            if outputs is not None:
+                outputsb = _dumps_json(outputs)
                 parts.append(
                     (
                         f"{example_id}.outputs",
@@ -6462,8 +6463,8 @@ class Client:
 
         if example.inputs:
             size += len(_dumps_json(example.inputs))
-        if example.outputs:
-            size += len(_dumps_json(example.outputs))
+        if example.reference_outputs:
+            size += len(_dumps_json(example.reference_outputs))
         if example.metadata:
             size += len(_dumps_json(example.metadata))
 
@@ -6650,7 +6651,8 @@ class Client:
             **kwargs (Any): Legacy keyword args. Should not be specified if 'examples' is specified.
 
                 - inputs (Sequence[Mapping[str, Any]]): The input values for the examples.
-                - outputs (Optional[Sequence[Optional[Mapping[str, Any]]]]): The output values for the examples.
+                - reference_outputs (Optional[Sequence[Optional[Mapping[str, Any]]]]): The reference output values for the examples.
+                - outputs (Optional[Sequence[Optional[Mapping[str, Any]]]]): Deprecated alias for reference_outputs.
                 - metadata (Optional[Sequence[Optional[Mapping[str, Any]]]]): The metadata for the examples.
                 - splits (Optional[Sequence[Optional[str | List[str]]]]): The splits for the examples, which are divisions of your dataset such as 'train', 'test', or 'validation'.
                 - source_run_ids (Optional[Sequence[Optional[Union[UUID, str]]]]): The IDs of the source runs associated with the examples.
@@ -6666,8 +6668,8 @@ class Client:
 
             Updated to take argument 'examples', a single list where each
             element is the full example to create. This should be used instead of the
-            legacy 'inputs', 'outputs', etc. arguments which split each examples
-            attributes across arguments.
+            legacy 'inputs', 'reference_outputs', etc. arguments which split each
+            example's attributes across arguments.
 
             Updated to support creating examples with attachments.
 
@@ -6682,12 +6684,12 @@ class Client:
             examples = [
                 {
                     "inputs": {"question": "what's an agent"},
-                    "outputs": {"answer": "an agent is..."},
+                    "reference_outputs": {"answer": "an agent is..."},
                     "metadata": {"difficulty": "easy"},
                 },
                 {
                     "inputs": {"question": "can you explain the agent architecture in this diagram?"},
-                    "outputs": {"answer": "this diagram shows..."},
+                    "reference_outputs": {"answer": "this diagram shows..."},
                     "attachments": {"diagram": {"mime_type": "image/png", "data": b"..."}},
                     "metadata": {"difficulty": "medium"},
                 },
@@ -6707,6 +6709,7 @@ class Client:
 
         supported_kwargs = {
             "inputs",
+            "reference_outputs",
             "outputs",
             "metadata",
             "splits",
@@ -6715,6 +6718,15 @@ class Client:
         }
         if kwargs and (unsupported := set(kwargs).difference(supported_kwargs)):
             raise ValueError(f"Received unsupported keyword arguments: {tuple(unsupported)}.")
+
+        if "reference_outputs" in kwargs and "outputs" in kwargs:
+            raise ValueError("Cannot specify both 'reference_outputs' and 'outputs'.")
+        if "outputs" in kwargs:
+            warnings.warn(
+                "'outputs' is deprecated. Use 'reference_outputs' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
 
         if not (dataset_id or dataset_name):
             raise ValueError("Either dataset_id or dataset_name must be provided.")
@@ -6736,20 +6748,21 @@ class Client:
                     raise ValueError(
                         f"Length of {arg_name} ({len(arg_value)}) does not match length of inputs ({input_len})"
                     )
+            reference_outputs = kwargs.get("reference_outputs", kwargs.get("outputs"))
             uploads = [
                 ls_schemas.ExampleCreate(
                     **{
                         "inputs": in_,
-                        "outputs": out_,
+                        "reference_outputs": reference_outputs_,
                         "metadata": metadata_,
                         "split": split_,
                         "id": id_ or str(uuid.uuid4()),
                         "source_run_id": source_run_id_,
                     }
                 )
-                for in_, out_, metadata_, split_, id_, source_run_id_ in zip(
+                for in_, reference_outputs_, metadata_, split_, id_, source_run_id_ in zip(
                     inputs,
-                    kwargs.get("outputs") or (None for _ in range(input_len)),
+                    reference_outputs or (None for _ in range(input_len)),
                     kwargs.get("metadata") or (None for _ in range(input_len)),
                     kwargs.get("splits") or (None for _ in range(input_len)),
                     kwargs.get("ids") or (None for _ in range(input_len)),
@@ -6846,7 +6859,7 @@ class Client:
         dataset_id: Optional[ID_TYPE] = None,
         dataset_name: Optional[str] = None,
         created_at: Optional[datetime.datetime] = None,
-        outputs: Optional[Mapping[str, Any]] = None,
+        reference_outputs: Optional[Mapping[str, Any]] = None,
         metadata: Optional[Mapping[str, Any]] = None,
         split: Optional[str | list[str]] = None,
         example_id: Optional[ID_TYPE] = None,
@@ -6854,6 +6867,8 @@ class Client:
         use_source_run_io: bool = False,
         use_source_run_attachments: Optional[list[str]] = None,
         attachments: Optional[ls_schemas.Attachments] = None,
+        *,
+        outputs: Optional[Mapping[str, Any]] = None,
     ) -> ls_schemas.Example:
         """Create a dataset example in the LangSmith API.
 
@@ -6870,8 +6885,8 @@ class Client:
                 The name of the dataset to create the example in.
             created_at (Optional[datetime.datetime]):
                 The creation timestamp of the example.
-            outputs (Optional[Mapping[str, Any]]):
-                The output values for the example.
+            reference_outputs (Optional[Mapping[str, Any]]):
+                The reference output values for the example.
             metadata (Optional[Mapping[str, Any]]):
                 The metadata for the example.
             split (Optional[str | List[str]]):
@@ -6889,10 +6904,22 @@ class Client:
                 is True, all attachments will be used regardless of this param.
             attachments (Optional[Attachments]):
                 The attachments for the example.
+            outputs (Optional[Mapping[str, Any]]):
+                Deprecated alias for reference_outputs.
 
         Returns:
             Example: The created example.
         """
+        if reference_outputs is not None and outputs is not None:
+            raise ValueError("Cannot specify both 'reference_outputs' and 'outputs'.")
+        if outputs is not None:
+            warnings.warn(
+                "'outputs' is deprecated. Use 'reference_outputs' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            reference_outputs = outputs
+
         if inputs is None and not use_source_run_io:
             raise ValueError("Must provide either inputs or use_source_run_io")
 
@@ -6902,7 +6929,7 @@ class Client:
         data = ls_schemas.ExampleCreate(
             **{
                 "inputs": inputs,
-                "outputs": outputs,
+                "reference_outputs": reference_outputs,
                 "metadata": metadata,
                 "split": split,
                 "source_run_id": source_run_id,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -110,7 +111,7 @@ class ExampleCreate(BaseModel):
     id: Optional[UUID] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     inputs: Optional[dict[str, Any]] = Field(default=None)
-    outputs: Optional[dict[str, Any]] = Field(default=None)
+    reference_outputs: Optional[dict[str, Any]] = Field(default=None)
     metadata: Optional[dict[str, Any]] = Field(default=None)
     split: Optional[Union[str, list[str]]] = None
     attachments: Optional[dict[str, _AttachmentLike]] = None
@@ -120,7 +121,30 @@ class ExampleCreate(BaseModel):
 
     def __init__(self, **data):
         """Initialize from dict."""
+        if "reference_outputs" in data and "outputs" in data:
+            raise ValueError("Cannot specify both 'reference_outputs' and 'outputs'.")
+        if "outputs" in data:
+            warnings.warn(
+                "'outputs' is deprecated for ExampleCreate. Use 'reference_outputs' instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            data["reference_outputs"] = data.pop("outputs")
         super().__init__(**data)
+
+    @property
+    def outputs(self) -> Optional[dict[str, Any]]:
+        """Deprecated alias for reference_outputs."""
+        return self.reference_outputs
+
+    @outputs.setter
+    def outputs(self, value: Optional[dict[str, Any]]) -> None:
+        warnings.warn(
+            "'outputs' is deprecated for ExampleCreate. Use 'reference_outputs' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        self.reference_outputs = value
 
 
 ExampleUploadWithAttachments = ExampleCreate

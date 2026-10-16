@@ -1175,7 +1175,7 @@ def test_upsert_examples_multipart(mock_session_cls: mock.Mock) -> None:
         dataset_id=dataset_id,
         created_at=created_at,
         inputs={"input": "test input"},
-        outputs={"output": "test output"},
+        reference_outputs={"output": "test output"},
         metadata={"meta": "data"},
         split="train",
         attachments={
@@ -1241,6 +1241,122 @@ def test_upsert_examples_multipart(mock_session_cls: mock.Mock) -> None:
             assert part.headers["Content-Type"] == "application/json"
 
 
+def test_example_create_reference_outputs_alias() -> None:
+    reference_outputs = {"answer": 42}
+
+    canonical = ls_schemas.ExampleCreate(reference_outputs=reference_outputs)
+    assert canonical.reference_outputs == reference_outputs
+    assert canonical.outputs == reference_outputs
+    assert canonical.model_dump(exclude_none=True)["reference_outputs"] == reference_outputs
+    assert "outputs" not in canonical.model_dump()
+
+    with pytest.warns(DeprecationWarning, match="Use 'reference_outputs' instead"):
+        legacy = ls_schemas.ExampleCreate(outputs=reference_outputs)
+    assert legacy.reference_outputs == reference_outputs
+    assert legacy.outputs == reference_outputs
+    assert legacy.model_dump(exclude_none=True)["reference_outputs"] == reference_outputs
+    assert "outputs" not in legacy.model_dump()
+
+    with pytest.raises(ValueError, match="both 'reference_outputs' and 'outputs'"):
+        ls_schemas.ExampleCreate(
+            reference_outputs=reference_outputs,
+            outputs=reference_outputs,
+        )
+
+
+@pytest.mark.parametrize("argument_name", ["reference_outputs", "outputs"])
+@mock.patch("langsmith.client.requests.Session")
+def test_create_example_json_uses_reference_outputs(
+    mock_session_cls: mock.Mock,
+    argument_name: str,
+) -> None:
+    example_id = uuid.uuid4()
+    dataset_id = uuid.uuid4()
+    reference_outputs = {"answer": 42}
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {
+        "id": str(example_id),
+        "dataset_id": str(dataset_id),
+        "inputs": {"question": "meaning"},
+        "outputs": reference_outputs,
+    }
+    mock_session = MagicMock()
+    mock_session.request.return_value = mock_response
+    mock_session_cls.return_value = mock_session
+    client = Client(
+        api_url="http://localhost:1984",
+        api_key="123",
+        info={},
+        auto_batch_tracing=False,
+    )
+
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        client.create_example(
+            inputs={"question": "meaning"},
+            dataset_id=dataset_id,
+            **{argument_name: reference_outputs},
+        )
+
+    request = next(call for call in mock_session.request.call_args_list if call.args[0] == "POST")
+    payload = json.loads(request.kwargs["data"])
+    assert payload["reference_outputs"] == reference_outputs
+    assert "outputs" not in payload
+    deprecations = [warning for warning in recorded if warning.category is DeprecationWarning]
+    assert len(deprecations) == (1 if argument_name == "outputs" else 0)
+
+
+def test_create_example_rejects_reference_outputs_conflict() -> None:
+    client = Client(api_url="http://localhost:1984", api_key="123", info={})
+
+    with pytest.raises(ValueError, match="both 'reference_outputs' and 'outputs'"):
+        client.create_example(
+            inputs={"question": "meaning"},
+            dataset_id=uuid.uuid4(),
+            reference_outputs={"answer": 42},
+            outputs={"answer": 43},
+        )
+
+
+@pytest.mark.parametrize("argument_name", ["reference_outputs", "outputs"])
+def test_create_examples_reference_outputs_alias(argument_name: str) -> None:
+    client = Client(api_url="http://localhost:1984", api_key="123", info={})
+    reference_outputs = [{"answer": 42}]
+
+    with mock.patch.object(
+        Client,
+        "_upload_examples_batches_parallel",
+        return_value=ls_schemas.UpsertExamplesResponse(example_ids=[], count=1, as_of=None),
+    ) as upload:
+        with warnings.catch_warnings(record=True) as recorded:
+            warnings.simplefilter("always")
+            client.create_examples(
+                dataset_id=uuid.uuid4(),
+                inputs=[{"question": "meaning"}],
+                **{argument_name: reference_outputs},
+            )
+
+    example = upload.call_args.args[0][0][0]
+    assert example.reference_outputs == reference_outputs[0]
+    assert example.model_dump(exclude_none=True)["reference_outputs"] == reference_outputs[0]
+    assert "outputs" not in example.model_dump()
+    deprecations = [warning for warning in recorded if warning.category is DeprecationWarning]
+    assert len(deprecations) == (1 if argument_name == "outputs" else 0)
+
+
+def test_create_examples_rejects_reference_outputs_conflict() -> None:
+    client = Client(api_url="http://localhost:1984", api_key="123", info={})
+
+    with pytest.raises(ValueError, match="both 'reference_outputs' and 'outputs'"):
+        client.create_examples(
+            dataset_id=uuid.uuid4(),
+            inputs=[{"question": "meaning"}],
+            reference_outputs=[{"answer": 42}],
+            outputs=[{"answer": 43}],
+        )
+
+
 @mock.patch("langsmith.client.requests.Session")
 def test_upsert_examples_multipart_missing_file(mock_session_cls: mock.Mock, tmp_path, caplog) -> None:
     """Attachment file paths that do not exist are skipped."""
@@ -1267,7 +1383,7 @@ def test_upsert_examples_multipart_missing_file(mock_session_cls: mock.Mock, tmp
         dataset_id=dataset_id,
         created_at=_CREATED_AT,
         inputs={"input": "test"},
-        outputs={"output": "out"},
+        reference_outputs={"output": "out"},
         attachments={
             "missing": ("text/plain", missing_path),
             "good": ("text/plain", b"data"),
