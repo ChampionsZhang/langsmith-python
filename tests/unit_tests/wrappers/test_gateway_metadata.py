@@ -82,6 +82,44 @@ def test_wrap_openai_copies_gateway_metadata(gateway_header, expected) -> None:
     assert runs[0].metadata.get("ls_gateway_info") == expected
 
 
+def test_wrap_openai_adds_flat_filter_keys() -> None:
+    header = {
+        **_GATEWAY_HEADER,
+        "outcome": "blocked",
+        "selected_model": "claude-haiku",
+        "attempts": 2,
+        "blocking_policies": [
+            {"id": "p1", "name": "No PII", "policy_type": "guard"},
+            {"id": "p2", "name": "Budget", "policy_type": "spend_limit"},
+        ],
+    }
+    client = wrap_openai(
+        openai.OpenAI(
+            api_key="test",
+            http_client=httpx.Client(transport=httpx.MockTransport(_handler(json.dumps(header)))),
+        )
+    )
+    runs, extra = _capture_run()
+
+    with tracing_context(enabled=True):
+        client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": "hi"}],
+            langsmith_extra=extra,
+        )
+
+    flat = {k: v for k, v in runs[0].metadata.items() if k.startswith("ls_gateway.")}
+    assert flat == {
+        "ls_gateway.request_id": header["request_id"],
+        "ls_gateway.outcome": "blocked",
+        "ls_gateway.provider": "anthropic",
+        "ls_gateway.model": "claude-haiku",
+        "ls_gateway.fallback_used": True,
+        "ls_gateway.attempts": 2,
+        "ls_gateway.blocking_policies": "No PII, Budget",
+    }
+
+
 async def test_wrap_async_openai_copies_gateway_metadata() -> None:
     client = wrap_openai(
         openai.AsyncOpenAI(

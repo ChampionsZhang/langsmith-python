@@ -20,7 +20,29 @@ _GATEWAY_METADATA_FIELDS = (
     "attempt_details",
     "fallback_used",
 )
+# Run search indexes only top-level metadata keys, so the most common filters
+# are also written as flat keys.
+_GATEWAY_FILTER_KEY_PREFIX = "ls_gateway."
 _HOOK_MARKER = "_langsmith_gateway_metadata_hook_installed"
+
+
+def _filter_keys(parsed: dict) -> dict[str, Any]:
+    policies = parsed.get("blocking_policies")
+    blocking = (
+        ", ".join(p["name"] for p in policies if isinstance(p, dict) and isinstance(p.get("name"), str))
+        if isinstance(policies, list)
+        else None
+    )
+    fields = {
+        "request_id": parsed.get("request_id"),
+        "outcome": parsed.get("outcome"),
+        "provider": parsed.get("provider"),
+        "model": parsed.get("selected_model") or parsed.get("model"),
+        "fallback_used": parsed.get("fallback_used"),
+        "attempts": parsed.get("attempts"),
+        "blocking_policies": blocking,
+    }
+    return {_GATEWAY_FILTER_KEY_PREFIX + k: v for k, v in fields.items() if v is not None and v != ""}
 
 
 def _add_gateway_metadata(response: Any) -> None:
@@ -36,7 +58,7 @@ def _add_gateway_metadata(response: Any) -> None:
             return
         info = {k: parsed[k] for k in _GATEWAY_METADATA_FIELDS if k in parsed}
         if info:
-            run.add_metadata({_GATEWAY_METADATA_KEY: info})
+            run.add_metadata({_GATEWAY_METADATA_KEY: info, **_filter_keys(parsed)})
     except Exception:
         # Gateway metadata must never affect the provider call.
         return
