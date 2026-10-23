@@ -597,6 +597,148 @@ def test_set_io_attributes_preserves_message_content(direction: str, content: ob
 
 
 @pytest.mark.parametrize("direction", ["input", "output"])
+@pytest.mark.parametrize(
+    ("content_calls", "metadata_calls", "expected_parts"),
+    [
+        (
+            [{"type": "tool_call", "name": "calculator", "args": {"x": 1}, "id": "c1"}],
+            [{"name": "calculator", "args": {"x": 1}, "id": "c1"}],
+            [
+                {"type": "tool_call", "name": "calculator", "arguments": {"x": 1}, "id": "c1"},
+                {"type": "text", "content": "after"},
+            ],
+        ),
+        (
+            [{"type": "tool_call", "name": "calculator", "args": {"x": 1}, "id": None}],
+            [{"name": "calculator", "args": {"x": 1}, "id": None}],
+            [{"type": "tool_call", "name": "calculator", "arguments": {"x": 1}}, {"type": "text", "content": "after"}],
+        ),
+        (
+            [{"type": "tool_call", "name": "calculator", "args": {"x": 1}, "id": "c1"}],
+            [],
+            [
+                {"type": "tool_call", "name": "calculator", "arguments": {"x": 1}, "id": "c1"},
+                {"type": "text", "content": "after"},
+            ],
+        ),
+        (
+            [{"type": "tool_call", "name": "calculator", "args": {"x": 1}, "id": "c1"}],
+            [
+                {"name": "calculator", "args": {"x": 1}, "id": "c1"},
+                {"name": "calculator", "args": {"x": 2}, "id": "c2"},
+            ],
+            [
+                {"type": "tool_call", "name": "calculator", "arguments": {"x": 1}, "id": "c1"},
+                {"type": "text", "content": "after"},
+                {"type": "tool_call", "name": "calculator", "arguments": {"x": 2}, "id": "c2"},
+            ],
+        ),
+        (
+            [{"type": "tool_call", "name": "calculator", "args": {"x": 1}, "id": None}],
+            [{"name": "calculator", "args": {"x": 2}, "id": None}],
+            [
+                {"type": "tool_call", "name": "calculator", "arguments": {"x": 1}},
+                {"type": "text", "content": "after"},
+                {"type": "tool_call", "name": "calculator", "arguments": {"x": 2}},
+            ],
+        ),
+        (
+            [{"type": "tool_call", "name": "calculator", "args": {"x": 1}, "id": None}],
+            [
+                {"name": "calculator", "args": {"x": 1}, "id": None},
+                {"name": "calculator", "args": {"x": 1}, "id": None},
+            ],
+            [
+                {"type": "tool_call", "name": "calculator", "arguments": {"x": 1}},
+                {"type": "text", "content": "after"},
+                {"type": "tool_call", "name": "calculator", "arguments": {"x": 1}},
+            ],
+        ),
+        (
+            [{"type": "tool_call", "args": {"x": 1}, "id": "c1"}],
+            [{"name": "calculator", "args": {"x": 1}, "id": "c1"}],
+            [
+                {"type": "text", "content": "after"},
+                {"type": "tool_call", "name": "calculator", "arguments": {"x": 1}, "id": "c1"},
+            ],
+        ),
+        (
+            [{"type": "tool_call", "name": "", "args": {"x": 1}, "id": "c1"}],
+            [],
+            [{"type": "text", "content": "after"}],
+        ),
+        (
+            [{"type": "tool_call", "args": {"x": 1}, "id": 7}],
+            [{"name": "calculator", "args": {"x": 1}, "id": "7"}],
+            [
+                {"type": "text", "content": "after"},
+                {"type": "tool_call", "name": "calculator", "arguments": {"x": 1}, "id": "7"},
+            ],
+        ),
+        (
+            [{"type": "tool_call", "name": "calculator", "args": {"x": 1}, "id": "c1"}],
+            [{"name": "calculator", "args": {"x": 2}, "id": "c1"}],
+            [
+                {"type": "tool_call", "name": "calculator", "arguments": {"x": 1}, "id": "c1"},
+                {"type": "text", "content": "after"},
+            ],
+        ),
+        (
+            [{"type": "tool_call", "name": "calculator", "id": "c1"}],
+            [{"name": "calculator", "args": {"x": 1}, "id": "c1"}],
+            [
+                {"type": "tool_call", "name": "calculator", "id": "c1"},
+                {"type": "text", "content": "after"},
+            ],
+        ),
+    ],
+    ids=[
+        "mirrored-id",
+        "mirrored-no-id",
+        "content-only",
+        "partial-overlap",
+        "distinct-no-id",
+        "repeated-no-id",
+        "missing-name",
+        "empty-name",
+        "raw-numeric-id",
+        "conflicting-arguments",
+        "missing-content-arguments",
+    ],
+)
+def test_set_io_attributes_merges_content_and_metadata_tool_calls(
+    direction: str, content_calls: list, metadata_calls: list, expected_parts: list
+):
+    from langchain_core.load.dump import dumpd
+    from langchain_core.messages import AIMessage
+
+    message = dumpd(
+        AIMessage(
+            content_blocks=[{"type": "text", "text": "before"}, *content_calls, {"type": "text", "text": "after"}],
+            tool_calls=metadata_calls,
+        )
+    )
+    op = SimpleNamespace(
+        id=uuid.uuid4(),
+        inputs=_orjson.dumps({"messages": [message]}) if direction == "input" else None,
+        outputs=_orjson.dumps(
+            {"generations": [{"message": message, "generation_info": {"finish_reason": "tool_calls"}}]}
+        )
+        if direction == "output"
+        else None,
+    )
+    span = MagicMock()
+
+    _make_exporter()._set_io_attributes(span, op)
+
+    attrs = {call.args[0]: call.args[1] for call in span.set_attribute.call_args_list}
+    expected = {"role": "assistant", "parts": [{"type": "text", "content": "before"}, *expected_parts]}
+    if direction == "output":
+        expected["finish_reason"] = "tool_call"
+    assert json.loads(attrs[f"gen_ai.{direction}.messages"]) == [expected]
+
+
+@pytest.mark.parametrize("direction", ["input", "output"])
 @pytest.mark.parametrize("failure_stage", ["conversion", "serialization"])
 def test_new_message_attribute_failure_preserves_legacy_io(direction: str, failure_stage: str):
     """Failures in new message attributes must not suppress legacy I/O."""

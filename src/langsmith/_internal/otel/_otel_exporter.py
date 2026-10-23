@@ -192,6 +192,8 @@ def _content_parts(content: Any) -> list[dict[str, Any]]:
             text = block.get("text", block.get("content"))
             if isinstance(text, str):
                 parts.append({"type": "text", "content": text})
+        elif isinstance(block, dict) and block.get("type") == "tool_call":
+            parts.extend(_tool_call_parts({"tool_calls": [block]}))
         elif isinstance(block, dict) and isinstance(block.get("type"), str):
             parts.append(block)
     return parts
@@ -266,7 +268,19 @@ def _convert_message_to_gen_ai(
     else:
         parts = _content_parts(data.get("content"))
         if role == "assistant":
-            parts.extend(_tool_call_parts(data))
+            # LangChain can mirror content tool calls in the tool_calls field.
+            # Keep the content version and its position when both identify the same call.
+            content_tool_calls = [part for part in parts if part.get("type") == "tool_call"]
+            for tool_call in _tool_call_parts(data):
+                for index, existing in enumerate(content_tool_calls):
+                    if tool_call == existing or (
+                        tool_call.get("id") is not None and tool_call.get("id") == existing.get("id")
+                    ):
+                        # Match each content call once, including calls without IDs.
+                        content_tool_calls.pop(index)
+                        break
+                else:
+                    parts.append(tool_call)
     if not role:
         return None
     return {"role": role, "parts": parts}
