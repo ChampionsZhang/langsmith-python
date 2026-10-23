@@ -469,6 +469,35 @@ def _attributes_for_outputs(outputs: dict) -> dict:
     return {call.args[0]: call.args[1] for call in span.set_attribute.call_args_list}
 
 
+@pytest.mark.parametrize("direction", ["input", "output"])
+@pytest.mark.parametrize("failure_stage", ["conversion", "serialization"])
+def test_new_message_attribute_failure_preserves_legacy_io(direction: str, failure_stage: str):
+    """Failures in new message attributes must not suppress legacy I/O."""
+    exporter = _make_exporter()
+    span = MagicMock()
+    inputs = {"messages": [{"role": "user", "content": "hello"}]}
+    outputs = {"generations": [{"text": "hi"}]}
+    op = SimpleNamespace(
+        id=uuid.uuid4(),
+        inputs=_orjson.dumps(inputs) if direction == "input" else None,
+        outputs=_orjson.dumps(outputs) if direction == "output" else None,
+    )
+    module = "langsmith._internal.otel._otel_exporter"
+    target = (
+        f"{module}._get_gen_ai_{direction}_messages" if failure_stage == "conversion" else f"{module}._orjson.dumps"
+    )
+
+    with patch(target, side_effect=ValueError("message conversion failed")) as fail:
+        exporter._set_io_attributes(span, op)
+
+    assert fail.called
+    attrs = {call.args[0]: call.args[1] for call in span.set_attribute.call_args_list}
+    legacy_name = "gen_ai.prompt" if direction == "input" else "gen_ai.completion"
+    payload = op.inputs if direction == "input" else op.outputs
+    assert attrs[legacy_name] == payload.decode("utf-8")
+    assert f"gen_ai.{direction}.messages" not in attrs
+
+
 def test_finish_reasons_preserve_all_openai_choices_as_a_list():
     attrs = _attributes_for_outputs(
         {

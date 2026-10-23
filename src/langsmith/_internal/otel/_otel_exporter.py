@@ -911,14 +911,17 @@ class OTELExporter:
                     if "extra_body" in inputs and inputs["extra_body"] is not None:
                         span.set_attribute(GEN_AI_REQUEST_EXTRA_BODY, inputs["extra_body"])
 
-                input_messages = _get_gen_ai_input_messages(inputs)
-                if input_messages:
-                    span.set_attribute(
-                        GEN_AI_INPUT_MESSAGES,
-                        _orjson.dumps(input_messages).decode("utf-8"),
-                    )
-
                 span.set_attribute(GENAI_PROMPT, op.inputs.decode("utf-8"))
+
+                try:
+                    input_messages = _get_gen_ai_input_messages(inputs)
+                    if input_messages:
+                        span.set_attribute(
+                            GEN_AI_INPUT_MESSAGES,
+                            _orjson.dumps(input_messages).decode("utf-8"),
+                        )
+                except Exception:
+                    logger.debug("Failed to build gen_ai.input.messages for run %s", op.id, exc_info=True)
 
             except Exception:
                 logger.debug("Failed to process inputs for run %s", op.id, exc_info=True)
@@ -978,14 +981,17 @@ class OTELExporter:
                             output_token_details = str(usage_metadata["output_token_details"])
                             span.set_attribute(GEN_AI_USAGE_OUTPUT_TOKEN_DETAILS, output_token_details)
 
-                output_messages = _get_gen_ai_output_messages(outputs)
-                if output_messages:
-                    span.set_attribute(
-                        GEN_AI_OUTPUT_MESSAGES,
-                        _orjson.dumps(output_messages).decode("utf-8"),
-                    )
-
                 span.set_attribute(GENAI_COMPLETION, op.outputs.decode("utf-8"))
+
+                try:
+                    output_messages = _get_gen_ai_output_messages(outputs)
+                    if output_messages:
+                        span.set_attribute(
+                            GEN_AI_OUTPUT_MESSAGES,
+                            _orjson.dumps(output_messages).decode("utf-8"),
+                        )
+                except Exception:
+                    logger.debug("Failed to build gen_ai.output.messages for run %s", op.id, exc_info=True)
 
             except Exception:
                 logger.debug("Failed to process outputs for run %s", op.id, exc_info=True)
