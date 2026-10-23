@@ -164,28 +164,36 @@ def _message_type_and_data(message: dict[str, Any]) -> tuple[Optional[str], dict
 
 def _normalize_message_role(message_type: Optional[str], data: dict) -> Optional[str]:
     """Map common LangChain message types to OTel GenAI roles."""
-    role = data.get("role") or data.get("type") or message_type
-    if not isinstance(role, str):
-        return None
-    role = role.lower().replace("messagechunk", "").replace("message", "")
-    return _GEN_AI_ROLE_ALIASES.get(role)
+    role = data.get("role")
+    if isinstance(role, str) and role:
+        return _GEN_AI_ROLE_ALIASES.get(role.lower(), role)
+
+    # Types may identify control messages, so only explicit roles allow custom values.
+    for message_kind in (data.get("type"), message_type):
+        if isinstance(message_kind, str):
+            normalized = message_kind.lower().replace("messagechunk", "").replace("message", "")
+            if role := _GEN_AI_ROLE_ALIASES.get(normalized):
+                return role
+    return None
 
 
-def _text_parts(content: Any) -> list[dict[str, Any]]:
-    """Convert LangChain text content to OTel GenAI text parts."""
+def _content_parts(content: Any) -> list[dict[str, Any]]:
+    """Convert text and preserve other typed content blocks in their original order."""
     if isinstance(content, str):
-        return [{"type": "text", "content": content}] if content else []
+        return [{"type": "text", "content": content}]
     if not isinstance(content, list):
         return []
 
     parts = []
     for block in content:
-        if isinstance(block, str) and block:
+        if isinstance(block, str):
             parts.append({"type": "text", "content": block})
         elif isinstance(block, dict) and block.get("type") == "text":
             text = block.get("text", block.get("content"))
-            if isinstance(text, str) and text:
+            if isinstance(text, str):
                 parts.append({"type": "text", "content": text})
+        elif isinstance(block, dict) and isinstance(block.get("type"), str):
+            parts.append(block)
     return parts
 
 
@@ -256,10 +264,10 @@ def _convert_message_to_gen_ai(
     if role == "tool":
         parts = _tool_call_response_parts(data)
     else:
-        parts = _text_parts(data.get("content"))
+        parts = _content_parts(data.get("content"))
         if role == "assistant":
             parts.extend(_tool_call_parts(data))
-    if not role or not parts:
+    if not role:
         return None
     return {"role": role, "parts": parts}
 

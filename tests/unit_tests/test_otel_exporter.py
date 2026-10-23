@@ -19,6 +19,7 @@ from langsmith._internal.otel._otel_exporter import (
     GEN_AI_TOOL_DEFINITIONS,
     GEN_AI_TOOL_NAME,
     OTELExporter,
+    _get_gen_ai_input_messages,
 )
 from langsmith.integrations.otel import (
     otel_safe_attribute_value,
@@ -149,12 +150,13 @@ def test_set_io_attributes_converts_tool_call_history_to_gen_ai_schema():
         {
             "role": "assistant",
             "parts": [
+                {"type": "text", "content": ""},
                 {
                     "type": "tool_call",
                     "id": "call_1",
                     "name": "calculator",
                     "arguments": {"expression": "2 + 2"},
-                }
+                },
             ],
         },
         {
@@ -211,12 +213,13 @@ def test_set_io_attributes_converts_provider_style_tool_calls():
         {
             "role": "assistant",
             "parts": [
+                {"type": "text", "content": ""},
                 {
                     "type": "tool_call",
                     "id": "call_1",
                     "name": "calculator",
                     "arguments": {"expression": "2 + 2"},
-                }
+                },
             ],
         }
     ]
@@ -264,12 +267,13 @@ def test_set_io_attributes_converts_tool_call_generation_to_gen_ai_schema():
         {
             "role": "assistant",
             "parts": [
+                {"type": "text", "content": ""},
                 {
                     "type": "tool_call",
                     "id": "call_1",
                     "name": "calculator",
                     "arguments": {"expression": "2 + 2"},
-                }
+                },
             ],
             "finish_reason": "tool_call",
         }
@@ -467,6 +471,129 @@ def _attributes_for_outputs(outputs: dict) -> dict:
     )
     _make_exporter()._set_io_attributes(span, op)
     return {call.args[0]: call.args[1] for call in span.set_attribute.call_args_list}
+
+
+@pytest.mark.parametrize(
+    ("message_class", "kwargs", "expected"),
+    [
+        ("AIMessageChunk", {"content": "hi"}, {"role": "assistant", "parts": [{"type": "text", "content": "hi"}]}),
+        ("HumanMessageChunk", {"content": "hi"}, {"role": "user", "parts": [{"type": "text", "content": "hi"}]}),
+        (
+            "ToolMessageChunk",
+            {"content": "x", "tool_call_id": "c1"},
+            {"role": "tool", "parts": [{"type": "tool_call_response", "response": "x", "id": "c1"}]},
+        ),
+        (
+            "ChatMessage",
+            {"content": "x", "role": "moderator"},
+            {"role": "moderator", "parts": [{"type": "text", "content": "x"}]},
+        ),
+        (
+            "ChatMessageChunk",
+            {"content": "x", "role": "Message Reviewer"},
+            {"role": "Message Reviewer", "parts": [{"type": "text", "content": "x"}]},
+        ),
+        (
+            "ChatMessage",
+            {"content": "x", "role": "HUMAN"},
+            {"role": "user", "parts": [{"type": "text", "content": "x"}]},
+        ),
+        ("HumanMessage", {"content": ""}, {"role": "user", "parts": [{"type": "text", "content": ""}]}),
+        ("SystemMessage", {"content": ""}, {"role": "system", "parts": [{"type": "text", "content": ""}]}),
+        (
+            "ToolMessage",
+            {"content": "", "tool_call_id": "c1"},
+            {"role": "tool", "parts": [{"type": "tool_call_response", "response": "", "id": "c1"}]},
+        ),
+        (
+            "FunctionMessage",
+            {"content": "", "name": "f"},
+            {"role": "tool", "parts": [{"type": "tool_call_response", "response": ""}]},
+        ),
+    ],
+)
+def test_gen_ai_input_messages_preserve_serialized_roles_and_empty_content(
+    message_class: str, kwargs: dict, expected: dict
+):
+    from langchain_core import messages
+    from langchain_core.load.dump import dumpd
+
+    message = getattr(messages, message_class)(**kwargs)
+
+    assert _get_gen_ai_input_messages({"messages": [dumpd(message)]}) == [expected]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"type": "AIMessageChunk", "data": {"content": "hi"}},
+        {"lc": 1, "id": ["langchain", "schema", "messages", "AIMessageChunk"], "kwargs": {"content": "hi"}},
+    ],
+)
+def test_gen_ai_input_messages_keep_known_type_and_class_fallbacks(message: dict):
+    assert _get_gen_ai_input_messages({"messages": [message]}) == [
+        {"role": "assistant", "parts": [{"type": "text", "content": "hi"}]}
+    ]
+
+
+def test_gen_ai_input_messages_preserve_order_without_exporting_control_types():
+    from langchain_core.load.dump import dumpd
+    from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage
+
+    messages = [
+        dumpd(HumanMessage(content="first")),
+        dumpd(RemoveMessage(id="old-message")),
+        {"type": "FutureInternalMessage", "content": "internal"},
+        dumpd(AIMessage(content="last")),
+    ]
+
+    assert _get_gen_ai_input_messages({"messages": [messages]}) == [
+        {"role": "user", "parts": [{"type": "text", "content": "first"}]},
+        {"role": "assistant", "parts": [{"type": "text", "content": "last"}]},
+    ]
+
+
+@pytest.mark.parametrize("direction", ["input", "output"])
+@pytest.mark.parametrize(
+    ("content", "expected_parts"),
+    [
+        ("", [{"type": "text", "content": ""}]),
+        (["", {"type": "text", "text": ""}], [{"type": "text", "content": ""}, {"type": "text", "content": ""}]),
+        (
+            [{"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}],
+            [{"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}],
+        ),
+        (
+            [{"type": "reasoning", "content": "thinking"}, {"type": "text", "text": "answer"}],
+            [{"type": "reasoning", "content": "thinking"}, {"type": "text", "content": "answer"}],
+        ),
+        ([{"foo": "bar"}], []),
+        (
+            [{"foo": "bar"}, {"type": "text", "text": "answer"}, {"type": 123}],
+            [{"type": "text", "content": "answer"}],
+        ),
+    ],
+    ids=["empty-text", "empty-text-blocks", "image", "reasoning-order", "untyped-only", "mixed-untyped"],
+)
+def test_set_io_attributes_preserves_message_content(direction: str, content: object, expected_parts: list):
+    role = "user" if direction == "input" else "assistant"
+    message = {"role": role, "content": content}
+    inputs = {"messages": [message]}
+    outputs = {"generations": [{"message": message, "generation_info": {"finish_reason": "stop"}}]}
+    op = SimpleNamespace(
+        id=uuid.uuid4(),
+        inputs=_orjson.dumps(inputs) if direction == "input" else None,
+        outputs=_orjson.dumps(outputs) if direction == "output" else None,
+    )
+    span = MagicMock()
+
+    _make_exporter()._set_io_attributes(span, op)
+
+    attrs = {call.args[0]: call.args[1] for call in span.set_attribute.call_args_list}
+    expected = {"role": role, "parts": expected_parts}
+    if direction == "output":
+        expected["finish_reason"] = "stop"
+    assert json.loads(attrs[f"gen_ai.{direction}.messages"]) == [expected]
 
 
 @pytest.mark.parametrize("direction", ["input", "output"])
