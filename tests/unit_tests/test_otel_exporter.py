@@ -738,6 +738,207 @@ def test_set_io_attributes_merges_content_and_metadata_tool_calls(
     assert json.loads(attrs[f"gen_ai.{direction}.messages"]) == [expected]
 
 
+@pytest.mark.parametrize(
+    "content_fields",
+    [
+        {"input": {"city": "SF"}},
+        {},
+        {"input": {}},
+        {"input": None},
+        {"input": {}, "partial_json": '{"city":'},
+        {"input": {"city": "NY"}},
+    ],
+    ids=["complete", "missing-input", "empty-input", "null-input", "partial-json", "conflicting-input"],
+)
+def test_set_io_attributes_prefers_metadata_for_mirrored_tool_use(content_fields: dict):
+    # Unlike normalized tool_call content, native tool_use defers to parsed metadata.
+    from langchain_core.load.dump import dumpd
+    from langchain_core.messages import AIMessage
+
+    message = dumpd(
+        AIMessage(
+            content=[
+                {"type": "text", "text": "before"},
+                {"type": "tool_use", "id": "toolu_1", "name": "get_weather", **content_fields},
+                {"type": "text", "text": "after"},
+            ],
+            tool_calls=[{"id": "toolu_1", "name": "get_weather", "args": {"city": "SF"}}],
+        )
+    )
+    op = SimpleNamespace(
+        id=uuid.uuid4(),
+        inputs=_orjson.dumps({"messages": [[message]]}),
+        outputs=_orjson.dumps({"generations": [[{"message": message}]]}),
+    )
+    span = MagicMock()
+
+    _make_exporter()._set_io_attributes(span, op)
+
+    expected = {
+        "role": "assistant",
+        "parts": [
+            {"type": "text", "content": "before"},
+            {"type": "tool_call", "id": "toolu_1", "name": "get_weather", "arguments": {"city": "SF"}},
+            {"type": "text", "content": "after"},
+        ],
+    }
+    attrs = {call.args[0]: call.args[1] for call in span.set_attribute.call_args_list}
+    assert json.loads(attrs["gen_ai.input.messages"]) == [expected]
+    assert json.loads(attrs["gen_ai.output.messages"]) == [{**expected, "finish_reason": "tool_call"}]
+
+
+def test_set_io_attributes_preserves_merged_tool_use_chunk_arguments():
+    from langchain_core.load.dump import dumpd
+    from langchain_core.messages import AIMessageChunk
+
+    start = AIMessageChunk(
+        content=[{"type": "tool_use", "index": 0, "id": "toolu_1", "name": "get_weather", "input": {}}],
+        tool_call_chunks=[{"index": 0, "id": "toolu_1", "name": "get_weather", "args": ""}],
+    )
+    delta = AIMessageChunk(
+        content=[{"type": "input_json_delta", "index": 0, "partial_json": '{"city":"SF"}'}],
+        tool_call_chunks=[{"index": 0, "id": None, "name": None, "args": '{"city":"SF"}'}],
+    )
+    merged = start + delta
+    assert merged.content[0]["input"] == {}
+    assert merged.tool_calls[0]["args"] == {"city": "SF"}
+    message = dumpd(merged)
+    op = SimpleNamespace(
+        id=uuid.uuid4(),
+        inputs=_orjson.dumps({"messages": [[message]]}),
+        outputs=_orjson.dumps({"generations": [[{"message": message}]]}),
+    )
+    span = MagicMock()
+
+    _make_exporter()._set_io_attributes(span, op)
+
+    expected = {
+        "role": "assistant",
+        "parts": [{"type": "tool_call", "id": "toolu_1", "name": "get_weather", "arguments": {"city": "SF"}}],
+    }
+    attrs = {call.args[0]: call.args[1] for call in span.set_attribute.call_args_list}
+    assert json.loads(attrs["gen_ai.input.messages"]) == [expected]
+    assert json.loads(attrs["gen_ai.output.messages"]) == [{**expected, "finish_reason": "tool_call"}]
+
+
+@pytest.mark.parametrize(
+    ("content_count", "metadata_arguments", "expected_arguments"),
+    [
+        (2, [{"a": 1}], [{"a": 1}, None]),
+        (1, [{"a": 1}, {"a": 99}], [{"a": 1}, {"a": 99}]),
+        (2, [{"a": 1}, {"a": 99}], [{"a": 1}, {"a": 99}]),
+    ],
+    ids=["repeated-content", "repeated-metadata", "repeated-both"],
+)
+def test_gen_ai_input_messages_match_tool_use_once(
+    content_count: int, metadata_arguments: list, expected_arguments: list
+):
+    block = {"type": "tool_use", "id": "t1", "name": "f", "input": {}}
+    message = {
+        "role": "assistant",
+        "content": [dict(block) for _ in range(content_count)],
+        "tool_calls": [{"id": "t1", "name": "f", "args": args} for args in metadata_arguments],
+    }
+
+    parts = _get_gen_ai_input_messages({"messages": [message]})[0]["parts"]
+
+    assert parts == [
+        {"type": "tool_call", "id": "t1", "name": "f", "arguments": args} if args is not None else block
+        for args in expected_arguments
+    ]
+    assert parts[0] is not parts[1]
+    assert message["content"] == [block] * content_count
+
+
+@pytest.mark.parametrize("metadata_fields", [{}, {"args": None}, {"args": {}}], ids=["missing", "null", "empty"])
+def test_set_io_attributes_retains_tool_use_input_when_metadata_arguments_are_empty(metadata_fields: dict):
+    message = {
+        "role": "assistant",
+        "content": [{"type": "tool_use", "id": "t1", "name": "f", "input": {"city": "SF"}}],
+        "tool_calls": [{"id": "t1", "name": "f", **metadata_fields}],
+    }
+    op = SimpleNamespace(
+        id=uuid.uuid4(),
+        inputs=_orjson.dumps({"messages": [message]}),
+        outputs=_orjson.dumps({"generations": [{"message": message}]}),
+    )
+    span = MagicMock()
+
+    _make_exporter()._set_io_attributes(span, op)
+
+    expected = {
+        "role": "assistant",
+        "parts": [{"type": "tool_call", "id": "t1", "name": "f", "arguments": {"city": "SF"}}],
+    }
+    attrs = {call.args[0]: call.args[1] for call in span.set_attribute.call_args_list}
+    assert json.loads(attrs["gen_ai.input.messages"]) == [expected]
+    assert json.loads(attrs["gen_ai.output.messages"]) == [{**expected, "finish_reason": "tool_call"}]
+
+
+@pytest.mark.parametrize(
+    "id_fields", [{"id": "other-call"}, {}, {"id": None}], ids=["different-id", "missing-id", "null-id"]
+)
+def test_gen_ai_input_messages_preserve_unmatched_tool_use(id_fields: dict):
+    from langchain_core.load.dump import dumpd
+    from langchain_core.messages import AIMessage
+
+    block = {
+        "type": "tool_use",
+        **id_fields,
+        "name": "get_weather",
+        "input": {},
+        "partial_json": '{"city":"SF"}',
+        "index": 0,
+        "cache_control": {"type": "ephemeral"},
+    }
+    message = dumpd(
+        AIMessage(
+            content=[block],
+            tool_calls=[{"id": "toolu_1", "name": "get_weather", "args": {"city": "SF"}}],
+        )
+    )
+
+    assert _get_gen_ai_input_messages({"messages": [message]}) == [
+        {
+            "role": "assistant",
+            "parts": [
+                block,
+                {"type": "tool_call", "id": "toolu_1", "name": "get_weather", "arguments": {"city": "SF"}},
+            ],
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "content_fields",
+    [{"input": '{"a":1}'}, {"input": {}, "partial_json": '{"city":"SF"}'}],
+    ids=["string-input", "partial-json-only"],
+)
+def test_gen_ai_input_messages_do_not_parse_tool_use_argument_fallbacks(content_fields: dict):
+    message = {
+        "role": "assistant",
+        "content": [{"type": "tool_use", "id": "t1", "name": "f", **content_fields}],
+        "tool_calls": [{"id": "t1", "name": "f"}],
+    }
+
+    assert _get_gen_ai_input_messages({"messages": [message]}) == [
+        {"role": "assistant", "parts": [{"type": "tool_call", "id": "t1", "name": "f"}]}
+    ]
+
+
+def test_gen_ai_input_messages_keep_unmatched_tool_use_and_metadata_without_ids():
+    block = {"type": "tool_use", "name": "f", "input": {"a": 1}}
+    message = {
+        "role": "assistant",
+        "content": [block],
+        "tool_calls": [{"name": "f", "args": {"a": 1}}],
+    }
+
+    assert _get_gen_ai_input_messages({"messages": [message]}) == [
+        {"role": "assistant", "parts": [block, {"type": "tool_call", "name": "f", "arguments": {"a": 1}}]}
+    ]
+
+
 @pytest.mark.parametrize("direction", ["input", "output"])
 @pytest.mark.parametrize("failure_stage", ["conversion", "serialization"])
 def test_new_message_attribute_failure_preserves_legacy_io(direction: str, failure_stage: str):

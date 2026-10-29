@@ -268,16 +268,34 @@ def _convert_message_to_gen_ai(
     else:
         parts = _content_parts(data.get("content"))
         if role == "assistant":
+            metadata_tool_calls = _tool_call_parts(data)
             # LangChain can mirror content tool calls in the tool_calls field.
-            # Keep the content version and its position when both identify the same call.
-            content_tool_calls = [part for part in parts if part.get("type") == "tool_call"]
-            for tool_call in _tool_call_parts(data):
-                for index, existing in enumerate(content_tool_calls):
+            # Normalized tool_call content wins; provider-native tool_use defers to
+            # parsed metadata, which carries completed streaming arguments.
+            content_tool_calls = [
+                (index, part) for index, part in enumerate(parts) if part.get("type") in ("tool_call", "tool_use")
+            ]
+            for tool_call in metadata_tool_calls:
+                for candidate_index, (part_index, existing) in enumerate(content_tool_calls):
                     if tool_call == existing or (
-                        tool_call.get("id") is not None and tool_call.get("id") == existing.get("id")
+                        tool_call.get("id") is not None
+                        and existing.get("id") is not None
+                        and tool_call["id"] == str(existing["id"])
                     ):
-                        # Match each content call once, including calls without IDs.
-                        content_tool_calls.pop(index)
+                        if existing.get("type") == "tool_use":
+                            # Parsed metadata includes completed streaming arguments.
+                            # Fall back only to non-empty object input, not partial_json.
+                            replacement = dict(tool_call)
+                            if (
+                                replacement.get("arguments") in (None, {})
+                                and isinstance(existing.get("input"), dict)
+                                and existing["input"]
+                            ):
+                                replacement["arguments"] = existing["input"]
+                            parts[part_index] = replacement
+                        # Consume each match once. Only tool_call supports equality
+                        # matching without IDs; tool_use requires matching IDs.
+                        content_tool_calls.pop(candidate_index)
                         break
                 else:
                     parts.append(tool_call)
