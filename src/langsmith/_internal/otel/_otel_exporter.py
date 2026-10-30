@@ -133,6 +133,10 @@ _GEN_AI_ROLE_ALIASES = {
     "user": "user",
 }
 
+_RESPONSES_TOOL_CALL_TYPES = ("function_call", "custom_tool_call")
+_MIRRORED_TOOL_CALL_TYPES = ("tool_use", *_RESPONSES_TOOL_CALL_TYPES)
+_CONTENT_TOOL_CALL_TYPES = ("tool_call", *_MIRRORED_TOOL_CALL_TYPES)
+
 
 def _get_operation_name(run_type: str) -> str:
     return WELL_KNOWN_OPERATION_NAMES.get(run_type, run_type)
@@ -277,37 +281,43 @@ def _convert_message_to_gen_ai(
         if role == "assistant":
             metadata_tool_calls = _tool_call_parts(data)
             # LangChain can mirror content tool calls in the tool_calls field.
-            # Normalized tool_call content wins; provider-native tool_use and
-            # function_call defer to parsed metadata with completed streaming arguments.
+            # Normalized tool_call content wins. tool_use, function_call, and
+            # custom_tool_call defer to metadata with completed streaming arguments.
             content_tool_calls = [
-                (index, part)
-                for index, part in enumerate(parts)
-                if part.get("type") in ("tool_call", "tool_use", "function_call")
+                (index, part) for index, part in enumerate(parts) if part.get("type") in _CONTENT_TOOL_CALL_TYPES
             ]
             for tool_call in metadata_tool_calls:
                 for candidate_index, (part_index, existing) in enumerate(content_tool_calls):
                     # Responses identifies calls with call_id; id identifies the item.
                     # Without call_id, leave the block unmatched rather than guessing.
                     existing_id = (
-                        existing.get("call_id") if existing.get("type") == "function_call" else existing.get("id")
+                        existing.get("call_id")
+                        if existing.get("type") in _RESPONSES_TOOL_CALL_TYPES
+                        else existing.get("id")
                     )
                     if tool_call == existing or (
                         tool_call.get("id") is not None
                         and existing_id is not None
                         and tool_call["id"] == str(existing_id)
                     ):
-                        if existing.get("type") in ("tool_use", "function_call"):
+                        if existing.get("type") in _MIRRORED_TOOL_CALL_TYPES:
                             # Parsed metadata includes completed streaming arguments.
-                            # Only complete, non-empty objects can fill missing arguments.
                             replacement = dict(tool_call)
                             if replacement.get("arguments") in (None, {}):
-                                arguments = (
-                                    existing.get("input")
-                                    if existing.get("type") == "tool_use"
-                                    else _parse_json_object(existing.get("arguments"))
-                                )
-                                if isinstance(arguments, dict) and arguments:
-                                    replacement["arguments"] = arguments
+                                if existing.get("type") == "custom_tool_call":
+                                    # Custom tools accept free text, including empty strings.
+                                    text = existing.get("input")
+                                    if isinstance(text, str):
+                                        replacement["arguments"] = {"__arg1": text}
+                                else:
+                                    # Object fallbacks must be complete and non-empty.
+                                    arguments = (
+                                        existing.get("input")
+                                        if existing.get("type") == "tool_use"
+                                        else _parse_json_object(existing.get("arguments"))
+                                    )
+                                    if isinstance(arguments, dict) and arguments:
+                                        replacement["arguments"] = arguments
                             parts[part_index] = replacement
                         # Consume each match once. Only tool_call supports equality
                         # matching without IDs; provider-native parts require call IDs.
