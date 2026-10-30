@@ -830,10 +830,15 @@ def test_set_io_attributes_preserves_merged_tool_use_chunk_arguments():
     ],
     ids=["repeated-content", "repeated-metadata", "repeated-both"],
 )
-def test_gen_ai_input_messages_match_tool_use_once(
-    content_count: int, metadata_arguments: list, expected_arguments: list
+@pytest.mark.parametrize("block_type", ["tool_use", "function_call"])
+def test_gen_ai_input_messages_match_provider_tool_calls_once(
+    content_count: int, metadata_arguments: list, expected_arguments: list, block_type: str
 ):
-    block = {"type": "tool_use", "id": "t1", "name": "f", "input": {}}
+    block = (
+        {"type": "tool_use", "id": "t1", "name": "f", "input": {}}
+        if block_type == "tool_use"
+        else {"type": "function_call", "id": "fc_item_1", "call_id": "t1", "name": "f", "arguments": "{}"}
+    )
     message = {
         "role": "assistant",
         "content": [dict(block) for _ in range(content_count)],
@@ -936,6 +941,170 @@ def test_gen_ai_input_messages_keep_unmatched_tool_use_and_metadata_without_ids(
 
     assert _get_gen_ai_input_messages({"messages": [message]}) == [
         {"role": "assistant", "parts": [block, {"type": "tool_call", "name": "f", "arguments": {"a": 1}}]}
+    ]
+
+
+@pytest.mark.parametrize("streamed", [False, True], ids=["message", "merged-chunk"])
+def test_set_io_attributes_merges_responses_function_calls(streamed: bool):
+    from langchain_core.load.dump import dumpd
+    from langchain_core.messages import AIMessage, AIMessageChunk
+
+    block = {
+        "type": "function_call",
+        "id": "fc_item_1",
+        "call_id": "call_1",
+        "name": "get_weather",
+        "arguments": '{"city":"SF"}',
+    }
+    if streamed:
+        start = AIMessageChunk(
+            content=[{"type": "text", "text": "before"}, {**block, "index": 1, "arguments": ""}],
+            tool_call_chunks=[{"index": 1, "id": "call_1", "name": "get_weather", "args": ""}],
+        )
+        delta = AIMessageChunk(
+            content=[{"type": "function_call", "index": 1, "arguments": '{"city":"SF"}'}],
+            tool_call_chunks=[{"index": 1, "id": None, "name": None, "args": '{"city":"SF"}'}],
+        )
+        message = start + delta
+        # Fix the upstream merge preconditions for this exporter regression.
+        assert message.content[1]["call_id"] == "call_1"
+        assert message.content[1]["id"] == "fc_item_1"
+        assert message.tool_calls[0]["args"] == {"city": "SF"}
+    else:
+        message = AIMessage(
+            content=[{"type": "text", "text": "before"}, block],
+            tool_calls=[{"id": "call_1", "name": "get_weather", "args": {"city": "SF"}}],
+        )
+    serialized = dumpd(message)
+    op = SimpleNamespace(
+        id=uuid.uuid4(),
+        inputs=_orjson.dumps({"messages": [[serialized]]}),
+        outputs=_orjson.dumps({"generations": [[{"message": serialized}]]}),
+    )
+    span = MagicMock()
+
+    _make_exporter()._set_io_attributes(span, op)
+
+    expected = {
+        "role": "assistant",
+        "parts": [
+            {"type": "text", "content": "before"},
+            {"type": "tool_call", "id": "call_1", "name": "get_weather", "arguments": {"city": "SF"}},
+        ],
+    }
+    attrs = {call.args[0]: call.args[1] for call in span.set_attribute.call_args_list}
+    assert json.loads(attrs["gen_ai.input.messages"]) == [expected]
+    assert json.loads(attrs["gen_ai.output.messages"]) == [{**expected, "finish_reason": "tool_call"}]
+    assert attrs["gen_ai.prompt"] == op.inputs.decode("utf-8")
+    assert attrs["gen_ai.completion"] == op.outputs.decode("utf-8")
+
+
+@pytest.mark.parametrize(
+    "call_id_fields", [{}, {"call_id": None}, {"call_id": "other-call"}], ids=["missing", "null", "different"]
+)
+def test_gen_ai_input_messages_do_not_match_responses_item_ids(call_id_fields: dict):
+    # The item id deliberately equals the metadata id; it must never substitute for call_id.
+    block = {"type": "function_call", "id": "call_1", "name": "f", "arguments": '{"a":1}', **call_id_fields}
+    message = {
+        "role": "assistant",
+        "content": [block],
+        "tool_calls": [{"id": "call_1", "name": "f", "args": {"a": 1}}],
+    }
+
+    assert _get_gen_ai_input_messages({"messages": [message]}) == [
+        {
+            "role": "assistant",
+            "parts": [block, {"type": "tool_call", "id": "call_1", "name": "f", "arguments": {"a": 1}}],
+        }
+    ]
+
+
+@pytest.mark.parametrize("metadata_fields", [{}, {"args": None}, {"args": {}}], ids=["missing", "null", "empty"])
+def test_gen_ai_input_messages_fill_empty_metadata_from_responses_arguments(metadata_fields: dict):
+    message = {
+        "role": "assistant",
+        "content": [
+            {"type": "function_call", "id": "fc_item_1", "call_id": "call_1", "name": "f", "arguments": '{"city":"SF"}'}
+        ],
+        "tool_calls": [{"id": "call_1", "name": "f", **metadata_fields}],
+    }
+
+    assert _get_gen_ai_input_messages({"messages": [message]}) == [
+        {
+            "role": "assistant",
+            "parts": [{"type": "tool_call", "id": "call_1", "name": "f", "arguments": {"city": "SF"}}],
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "metadata_fields", "expected_part"),
+    [
+        ('{"city":', {}, {"type": "tool_call", "id": "call_1", "name": "f"}),
+        ('{"city":', {"args": None}, {"type": "tool_call", "id": "call_1", "name": "f"}),
+        ('{"city":', {"args": {}}, {"type": "tool_call", "id": "call_1", "name": "f", "arguments": {}}),
+        ("", {}, {"type": "tool_call", "id": "call_1", "name": "f"}),
+        ("5", {}, {"type": "tool_call", "id": "call_1", "name": "f"}),
+        ("[1,2]", {}, {"type": "tool_call", "id": "call_1", "name": "f"}),
+        ("{}", {}, {"type": "tool_call", "id": "call_1", "name": "f"}),
+        ("null", {}, {"type": "tool_call", "id": "call_1", "name": "f"}),
+    ],
+    ids=[
+        "partial-json-missing-metadata-arguments",
+        "partial-json-null-metadata-arguments",
+        "partial-json-empty-metadata-arguments",
+        "empty-string",
+        "scalar",
+        "array",
+        "empty-object",
+        "null",
+    ],
+)
+def test_gen_ai_input_messages_skip_unusable_responses_argument_fallbacks(
+    arguments: str, metadata_fields: dict, expected_part: dict
+):
+    message = {
+        "role": "assistant",
+        "content": [
+            {"type": "function_call", "id": "fc_item_1", "call_id": "call_1", "name": "f", "arguments": arguments}
+        ],
+        "tool_calls": [{"id": "call_1", "name": "f", **metadata_fields}],
+    }
+
+    assert _get_gen_ai_input_messages({"messages": [message]}) == [{"role": "assistant", "parts": [expected_part]}]
+
+
+def test_gen_ai_input_messages_prefer_metadata_name_for_responses_calls():
+    message = {
+        "role": "assistant",
+        "content": [{"type": "function_call", "call_id": "call_1", "name": "content_name", "arguments": '{"a":1}'}],
+        "tool_calls": [{"id": "call_1", "name": "metadata_name", "args": {"a": 2}}],
+    }
+
+    assert _get_gen_ai_input_messages({"messages": [message]}) == [
+        {
+            "role": "assistant",
+            "parts": [{"type": "tool_call", "id": "call_1", "name": "metadata_name", "arguments": {"a": 2}}],
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected"),
+    [("{}", {}), ('{"a":', '{"a":'), ("5", "5")],
+    ids=["empty-object", "partial-json", "scalar"],
+)
+def test_gen_ai_input_messages_preserve_provider_argument_parsing(arguments: str, expected: object):
+    message = {
+        "role": "assistant",
+        "additional_kwargs": {"tool_calls": [{"id": "call_1", "function": {"name": "f", "arguments": arguments}}]},
+    }
+
+    assert _get_gen_ai_input_messages({"messages": [message]}) == [
+        {
+            "role": "assistant",
+            "parts": [{"type": "tool_call", "id": "call_1", "name": "f", "arguments": expected}],
+        }
     ]
 
 

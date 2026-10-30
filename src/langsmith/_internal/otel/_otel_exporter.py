@@ -199,6 +199,19 @@ def _content_parts(content: Any) -> list[dict[str, Any]]:
     return parts
 
 
+def _parse_json_object(value: Any) -> Optional[dict[str, Any]]:
+    """Return an object argument payload, parsing strings that contain JSON objects."""
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = _orjson.loads(value)
+    except _orjson.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def _tool_call_parts(data: dict[str, Any]) -> list[dict[str, Any]]:
     """Convert normalized or provider-style tool calls to OTel GenAI parts."""
     tool_calls = data.get("tool_calls")
@@ -217,14 +230,8 @@ def _tool_call_parts(data: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(function, dict):
             name = function.get("name")
             arguments = function.get("arguments")
-            if isinstance(arguments, str):
-                try:
-                    parsed_arguments = _orjson.loads(arguments)
-                except _orjson.JSONDecodeError:
-                    pass
-                else:
-                    if isinstance(parsed_arguments, dict):
-                        arguments = parsed_arguments
+            if (parsed_arguments := _parse_json_object(arguments)) is not None:
+                arguments = parsed_arguments
         else:
             name = tool_call.get("name")
             arguments = tool_call.get("args", tool_call.get("arguments"))
@@ -270,31 +277,40 @@ def _convert_message_to_gen_ai(
         if role == "assistant":
             metadata_tool_calls = _tool_call_parts(data)
             # LangChain can mirror content tool calls in the tool_calls field.
-            # Normalized tool_call content wins; provider-native tool_use defers to
-            # parsed metadata, which carries completed streaming arguments.
+            # Normalized tool_call content wins; provider-native tool_use and
+            # function_call defer to parsed metadata with completed streaming arguments.
             content_tool_calls = [
-                (index, part) for index, part in enumerate(parts) if part.get("type") in ("tool_call", "tool_use")
+                (index, part)
+                for index, part in enumerate(parts)
+                if part.get("type") in ("tool_call", "tool_use", "function_call")
             ]
             for tool_call in metadata_tool_calls:
                 for candidate_index, (part_index, existing) in enumerate(content_tool_calls):
+                    # Responses identifies calls with call_id; id identifies the item.
+                    # Without call_id, leave the block unmatched rather than guessing.
+                    existing_id = (
+                        existing.get("call_id") if existing.get("type") == "function_call" else existing.get("id")
+                    )
                     if tool_call == existing or (
                         tool_call.get("id") is not None
-                        and existing.get("id") is not None
-                        and tool_call["id"] == str(existing["id"])
+                        and existing_id is not None
+                        and tool_call["id"] == str(existing_id)
                     ):
-                        if existing.get("type") == "tool_use":
+                        if existing.get("type") in ("tool_use", "function_call"):
                             # Parsed metadata includes completed streaming arguments.
-                            # Fall back only to non-empty object input, not partial_json.
+                            # Only complete, non-empty objects can fill missing arguments.
                             replacement = dict(tool_call)
-                            if (
-                                replacement.get("arguments") in (None, {})
-                                and isinstance(existing.get("input"), dict)
-                                and existing["input"]
-                            ):
-                                replacement["arguments"] = existing["input"]
+                            if replacement.get("arguments") in (None, {}):
+                                arguments = (
+                                    existing.get("input")
+                                    if existing.get("type") == "tool_use"
+                                    else _parse_json_object(existing.get("arguments"))
+                                )
+                                if isinstance(arguments, dict) and arguments:
+                                    replacement["arguments"] = arguments
                             parts[part_index] = replacement
                         # Consume each match once. Only tool_call supports equality
-                        # matching without IDs; tool_use requires matching IDs.
+                        # matching without IDs; provider-native parts require call IDs.
                         content_tool_calls.pop(candidate_index)
                         break
                 else:
